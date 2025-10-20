@@ -1,0 +1,18 @@
+{
+  "name": "wabot-gemini",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot with Gemini API on Termux",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Gemini",
+  "license": "ISC",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc.6",
+    "dotenv": "^16.6.1",
+    "pino": "^10.1.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
