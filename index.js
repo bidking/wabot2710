@@ -1,4 +1,4 @@
-// index.js (Final Fix: Log stub + Media ViewOnce bekerja dua arah)
+// index.js (Versi Final: Paksa Unduh View Once dengan Quote)
 
 require('dotenv').config();
 const path = require('path');
@@ -7,19 +7,22 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  downloadMediaMessage
+  downloadMediaMessage,
+  proto
 } = require('@whiskeysockets/baileys');
 const { GoogleGenerativeAIFetchError, GoogleGenerativeAI } = require('@google/generative-ai');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
+const sharp = require('sharp');
 const { exec } = require('child_process');
-const { randomBytes } = require('crypto');
+const util = require('util');
+const execPromise = util.promisify(exec);
 
-// === KONSTANTA PENYIMPANAN ===
-const VIEWONCE_DIR = path.join(process.cwd(), 'viewonce_cache_new');
-const VIEWONCE_JSON = path.join(process.cwd(), 'viewonce_cache_new.json');
-const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000; // 24 jam
-let viewOnceCache = {};
+// Gunakan ffmpeg dari sistem (Termux) bukan dari package
+const ffmpeg = 'ffmpeg';
+
+// --- Konstanta untuk Pengingat Percakapan ---
+const conversationMemory = new Map();
 // ==============================
 
 // 🧠 Cek API Key
@@ -44,50 +47,59 @@ const model = genAI.getGenerativeModel({
   systemInstruction: SYSTEM_INSTRUCTION
 });
 
-// === CACHE FUNGSIONALITAS ===
-async function loadCacheFromFile() {
-  try {
-    const data = await fs.readFile(VIEWONCE_JSON, 'utf8');
-    viewOnceCache = JSON.parse(data);
-    console.log('📦 Cache 1x lihat berhasil dimuat dari file.');
-  } catch {
-    console.log('ℹ️ Tidak ada file cache 1x lihat. Membuat cache baru.');
-    viewOnceCache = {};
-  }
+// === FUNGSI PENGINGAT PERCAKAPAN ===
+function getMemoryKey(jid) {
+  return jid;
 }
 
-async function saveCacheToFile() {
+function getMemory(jid) {
+  return conversationMemory.get(getMemoryKey(jid)) || [];
+}
+
+function setMemory(jid, memory) {
+  conversationMemory.set(getMemoryKey(jid), memory);
+}
+
+function addMessageToMemory(jid, role, content) {
+  const memory = getMemory(jid);
+  memory.push({ role, content });
+  if (memory.length > 20) {
+    memory.shift();
+  }
+  setMemory(jid, memory);
+}
+// ==============================
+
+// === FUNGSI GENERATE STIKER ===
+async function createSticker(mediaBuffer, isVideo = false) {
+  let tempInputPath = path.join(process.cwd(), `temp_${Date.now()}.${isVideo ? 'mp4' : 'jpg'}`);
+  let outputPath = path.join(process.cwd(), `temp_${Date.now()}.webp`);
+
   try {
-    await fs.writeFile(VIEWONCE_JSON, JSON.stringify(viewOnceCache, null, 2));
+    await fs.writeFile(tempInputPath, mediaBuffer);
+
+    if (isVideo) {
+      await execPromise(`${ffmpeg} -i ${tempInputPath} -vf "fps=15,scale=512:512:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -y ${outputPath}`);
+    } else {
+      await sharp(mediaBuffer)
+        .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .webp({ quality: 80 })
+        .toFile(outputPath);
+    }
+
+    const stickerBuffer = await fs.readFile(outputPath);
+    return stickerBuffer;
   } catch (error) {
-    console.error('❌ Gagal menyimpan cache 1x lihat ke file:', error);
-  }
-}
-
-async function cleanupExpiredCache() {
-  let cacheChanged = false;
-  const now = Date.now();
-  console.log('🧹 Menjalankan pembersihan cache 1x lihat...');
-  const entries = Object.entries(viewOnceCache);
-  for (const [messageId, entry] of entries) {
-    if (now - entry.timestamp > CACHE_EXPIRATION_MS) {
-      console.log(`🗑️ Menghapus file kedaluwarsa: ${entry.fileName}`);
-      try {
-        await fs.unlink(entry.filePath);
-        delete viewOnceCache[messageId];
-        cacheChanged = true;
-      } catch (e) {
-        if (e.code === 'ENOENT') {
-          delete viewOnceCache[messageId];
-          cacheChanged = true;
-        } else {
-          console.error(`❌ Gagal menghapus file ${entry.fileName}:`, e);
-        }
-      }
+    console.error("Gagal membuat stiker:", error);
+    throw error;
+  } finally {
+    try {
+      await fs.unlink(tempInputPath);
+      await fs.unlink(outputPath);
+    } catch (e) {
+      // Abaikan error jika file tidak ditemukan
     }
   }
-  if (cacheChanged) await saveCacheToFile();
-  console.log('🧹 Cache sudah bersih.');
 }
 // ==============================
 
@@ -95,13 +107,9 @@ async function connectToWhatsApp() {
   const authFolder = path.join(process.cwd(), 'auth_info_baileys');
   try {
     await fs.mkdir(authFolder, { recursive: true });
-    await fs.mkdir(VIEWONCE_DIR, { recursive: true });
   } catch (e) {
     console.error('❌ Gagal membuat folder:', e);
   }
-
-  await loadCacheFromFile();
-  await cleanupExpiredCache();
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
   const sock = makeWASocket({
@@ -127,227 +135,127 @@ async function connectToWhatsApp() {
     } else if (connection === 'open') console.log('✅ Bot Astro AI berhasil tersambung!');
   });
 
-  // === LOG STUB VIEWONCE (NOTIFIKASI “MENUNGGU MEDIA”) ===
+  // === EVENT UNTUK MENANGANI PEMBARUAN PESAN (VIEW ONCE) ===
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates) {
-      if (key?.isViewOnce && !update.message) {
-        console.log('\n---------------------------------');
-        console.log(`ℹ️ [INFO] Notifikasi pesan 1x lihat diterima dari ${key.remoteJid}. Menunggu konten media...`);
-        console.log('---------------------------------');
+      if (update.message && !key.fromMe) {
+        const viewOnceTypes = ['viewOnceMessageV2', 'viewOnceMessageV2Extension'];
+        let viewOncePayload = null;
+        for (const type of viewOnceTypes) {
+          if (update.message[type]) {
+            viewOncePayload = update.message[type];
+            break;
+          }
+        }
+
+        if (viewOncePayload?.message) {
+          const fullMsg = {
+            key: key,
+            message: update.message,
+            pushName: "Pengguna",
+            messageTimestamp: Date.now()
+          };
+          await handleViewOnceMessage(sock, fullMsg);
+        }
       }
     }
   });
 
-  // === HANDLE SEMUA PESAN MASUK ===
+  // --- FUNGSI UNTUK MENANGANI PESAN VIEW ONCE ---
+  async function handleViewOnceMessage(sock, msg) {
+    const senderJid = msg.key.remoteJid;
+    const senderName = msg.pushName || "Pengguna";
+    const messageId = msg.key.id;
+
+    if (global.viewOnceCache && global.viewOnceCache.has(messageId)) {
+      return;
+    }
+
+    console.log(`\n---------------------------------`);
+    console.log(`📸 [KONTEN 1x LIHAT DITEMUKAN & DIPROSES]`);
+    console.log(`  > Dari: ${senderName} (${senderJid})`);
+    console.log(`  > ID Pesan: ${messageId}`);
+
+    if (!global.viewOnceCache) {
+      global.viewOnceCache = new Map();
+    }
+    global.viewOnceCache.set(messageId, {
+      senderJid: senderJid,
+      msg: msg
+    });
+
+    console.log(`  > ✅ Pesan 1x lihat (ID: ${messageId}) berhasil diarsipkan di memori sementara.`);
+    await sock.sendMessage(senderJid, {
+      text: `✅ Foto/Video sekali lihat berhasil saya simpan.\n\nBalas pesan ini dengan /op untuk melihatnya lagi.`
+    });
+    console.log(`---------------------------------`);
+  }
+
+  // === EVENT UNTUK MENANGANI PESAN BARU ===
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg?.message) return;
 
-    const senderJid = msg.key.remoteJid; // Declaration moved to top
+    const senderJid = msg.key.remoteJid;
+    const senderName = msg.pushName || "Pengguna";
+    const isFromMe = msg.key.fromMe;
 
-    // === DETEKSI PESAN VIEWONCE SEBENARNYA ===
-    if (msg.message?.viewOnceMessageV2?.message) {
-      const fullMsg = msg;
-      console.log(`\n---------------------------------`);
-      console.log(`📸 [KONTEN 1x LIHAT DITEMUKAN]`);
-      console.log(`  > Dari: ${senderJid}`);
-      console.log(`  > ID Pesan: ${msg.key.id}`);
-
+    // --- LOGIKA UNTUK MENANGANI PESAN KOSONG YANG MERUPAKAN VIEW ONCE ---
+    // Ini adalah solusi untuk kasus di mana pesan view once datang sebagai pesan kosong
+    if (
+      !msg.message.conversation &&
+      !msg.message.extendedTextMessage &&
+      !msg.message.imageMessage &&
+      !msg.message.videoMessage &&
+      msg.key.id // Pastikan ada ID pesan
+    ) {
+      console.log(`\n[DEBUG] Menerima pesan kosong dengan ID: ${msg.key.id} dari ${senderJid}. Mungkin ini view once bermasalah. Mencoba memaksa konten dengan quote...`);
+      
       try {
-        const buffer = await downloadMediaMessage(fullMsg, 'buffer', {});
-        const v2msg = fullMsg.message.viewOnceMessageV2.message;
-        const isVideo = !!v2msg.videoMessage;
-        const messageId = msg.key.id;
-        const fileExtension = isVideo ? '.mp4' : '.jpg';
-        const fileName = `${messageId}${fileExtension}`;
-        const filePath = path.join(VIEWONCE_DIR, fileName);
-
-        await fs.writeFile(filePath, buffer);
-        viewOnceCache[messageId] = {
-          filePath,
-          fileName,
-          isVideo,
-          senderJid,
-          timestamp: Date.now()
-        };
-        await saveCacheToFile();
-
-        console.log(`  > ✅ Media 1x lihat (ID: ${messageId}) disimpan ke ${fileName}`);
+        // Paksa bot untuk me-reply pesan kosong ini untuk memancing konten
         await sock.sendMessage(senderJid, {
-          text: `✅ Media 1x lihat berhasil diarsipkan.\n\nBalas pesan aslinya dengan /op untuk membukanya lagi.`
+          text: "⏳ Mendeteksi media sekali liat, mohon tunggu...",
+          quoted: msg
         });
-      } catch (e) {
-        console.error(`❌ Gagal menyimpan media 1x lihat (ID: ${msg.key.id}):`, e);
-        await sock.sendMessage(senderJid, {
-          text: `⚠️ Gagal mengarsipkan media 1x lihat. Mungkin sudah dibuka atau kedaluwarsa.`
-        });
+
+        // Tunggu sebentar agar server WhatsApp punya waktu untuk merespons
+        await new Promise(resolve => setTimeout(resolve, 1500)); 
+
+        // Coba lagi untuk memproses pesan yang sama setelah di-quote
+        // Kita tidak perlu melakukan apa-apa di sini, karena jika berhasil,
+        // event 'messages.update' akan terpicu dan menangani sisanya.
+        // Pesan "⏳ Mendeteksi..." akan tertimpa oleh notifikasi sukses dari handleViewOnceMessage.
+        console.log(`[DEBUG] Pesan telah di-quote. Menunggu event 'update'...`);
+      } catch (error) {
+        console.error("[DEBUG] Gagal meng-quote pesan kosong:", error);
       }
-      console.log(`---------------------------------`);
+      // Jangan return di sini, biarkan flow berlanjut
+    }
+
+    // --- CEK VIEW ONCE YANG LENGKAP DI EVENT UPSERT ---
+    const viewOnceTypes = ['viewOnceMessageV2', 'viewOnceMessageV2Extension'];
+    let viewOncePayload = null;
+    for (const type of viewOnceTypes) {
+      if (msg.message[type]) {
+        viewOncePayload = msg.message[type];
+        break;
+      }
+    }
+
+    if (viewOncePayload?.message) {
+      await handleViewOnceMessage(sock, msg);
       return;
     }
 
-    // === /str untuk buat stiker ===
-    const type = Object.keys(msg.message)[0];
-    const body = (type === 'conversation' && msg.message.conversation) ? msg.message.conversation : 
-                 (type === 'extendedTextMessage' && msg.message.extendedTextMessage.text) ? msg.message.extendedTextMessage.text : 
-                 (type === 'imageMessage' && msg.message.imageMessage.caption) ? msg.message.imageMessage.caption : '';
-
-            if (body && body.toLowerCase().startsWith('/str')) {
-
-              let mediaMessage = null;
-
-              let mediaType = ''; // 'image' or 'video'
-
-        
-
-              // Find media (image or video, direct or quoted)
-
-              if (msg.message.imageMessage) {
-
-                  mediaMessage = msg.message.imageMessage;
-
-                  mediaType = 'image';
-
-              } else if (msg.message.videoMessage) {
-
-                  mediaMessage = msg.message.videoMessage;
-
-                  mediaType = 'video';
-
-              } else if (msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) {
-
-                  mediaMessage = msg.message.extendedTextMessage.contextInfo.quotedMessage.imageMessage;
-
-                  mediaType = 'image';
-
-              } else if (msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.videoMessage) {
-
-                  mediaMessage = msg.message.extendedTextMessage.contextInfo.quotedMessage.videoMessage;
-
-                  mediaType = 'video';
-
-              }
-
-        
-
-              if (mediaMessage) {
-
-                if (mediaType === 'video' && mediaMessage.seconds > 5) {
-
-                  await sock.sendMessage(senderJid, { text: '⚠️ Video terlalu panjang! Durasi maksimal untuk stiker video adalah 5 detik.' }, { quoted: msg });
-
-                  return;
-
-                }
-
-        
-
-                await sock.sendMessage(senderJid, { text: '⏳ Membuat stiker...' }, { quoted: msg });
-
-                
-
-                try {
-
-                  const downloadObject = { message: { [mediaType + 'Message']: mediaMessage } };
-
-                  const buffer = await downloadMediaMessage(downloadObject, 'buffer', {});
-
-                  
-
-                  const tempIn = path.join(VIEWONCE_DIR, `${randomBytes(6).toString('hex')}.${mediaType === 'image' ? 'jpg' : 'mp4'}`);
-
-                  const tempOut = path.join(VIEWONCE_DIR, `${randomBytes(6).toString('hex')}.webp`);
-
-        
-
-                  await fs.writeFile(tempIn, buffer);
-
-        
-
-                  let ffmpegCommand = '';
-
-                  if (mediaType === 'image') {
-
-                    ffmpegCommand = `ffmpeg -i ${tempIn} -vf "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black" -an ${tempOut}`;
-
-                  } else { // Video
-
-                    ffmpegCommand = `ffmpeg -i ${tempIn} -c:v libwebp -filter:v "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black,fps=15" -an -loop 0 -ss 00:00:00 -t 00:00:05 ${tempOut}`;
-
-                  }
-
-        
-
-                  exec(ffmpegCommand, async (error) => {
-
-                    const cleanup = async () => {
-
-                        try { await fs.unlink(tempIn); } catch {}
-
-                        try { await fs.unlink(tempOut); } catch {}
-
-                    };
-
-        
-
-                    if (error) {
-
-                      console.error('❌ Gagal membuat stiker:', error);
-
-                      await sock.sendMessage(senderJid, { text: '⚠️ Gagal membuat stiker. Pastikan ffmpeg terinstal dengan benar.' }, { quoted: msg });
-
-                      await cleanup();
-
-                      return;
-
-                    }
-
-        
-
-                    try {
-
-                      const stickerBuffer = await fs.readFile(tempOut);
-
-                      await sock.sendMessage(senderJid, { sticker: stickerBuffer });
-
-                    } catch (e) {
-
-                       console.error('❌ Gagal mengirim stiker:', e);
-
-                       await sock.sendMessage(senderJid, { text: '⚠️ Gagal mengirim stiker setelah konversi.' }, { quoted: msg });
-
-                    } finally {
-
-                        await cleanup();
-
-                    }
-
-                  });
-
-        
-
-                } catch (e) {
-
-                  console.error('❌ Gagal mengunduh media untuk stiker:', e);
-
-                  await sock.sendMessage(senderJid, { text: '⚠️ Gagal mengunduh gambar/video untuk dijadikan stiker.' }, { quoted: msg });
-
-                }
-
-        
-
-              } else {
-
-                await sock.sendMessage(senderJid, { text: 'Kirim gambar/video (maks 5 dtk) dengan caption /str atau balas media tsb dengan /str.' }, { quoted: msg });
-
-              }
-
-              return; 
-
-            }
-
-    // === PESAN TEKS BIASA ===
-    const senderName = msg.pushName || "Pengguna";
+    // --- SIMPAN PESAN TEKS KE MEMORY ---
+    if (!isFromMe) {
+        const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
+        if(messageText) {
+            addMessageToMemory(senderJid, 'user', messageText);
+        }
+    }
+
+    // --- PROSES PERINTAH ---
     const messageText = msg.message.conversation || msg.message.extendedTextMessage?.text;
     if (!messageText) return;
 
@@ -357,51 +265,184 @@ async function connectToWhatsApp() {
     console.log(`  > Pesan: "${messageText}"`);
     console.log(`---------------------------------`);
 
-    // === /op untuk buka ulang ===
-    if (messageText.toLowerCase() === '/op') {
-      const quoted = msg.message.extendedTextMessage?.contextInfo;
-      if (!quoted?.stanzaId) {
-        await sock.sendMessage(senderJid, { text: "Gunakan /op dengan me-reply pesan 1x lihat yang ingin dibuka." });
+    const command = messageText.toLowerCase().trim();
+
+    // === /op untuk buka ulang view once atau "mencuri" media biasa ===
+    if (command === '/op') {
+      const quotedMsgId = msg.message.extendedTextMessage?.contextInfo?.stanzaId;
+      
+      if (!quotedMsgId) {
+        await sock.sendMessage(senderJid, { text: "❌ Reply sebuah pesan yang berisi gambar/video, atau reply notifikasi dari bot, lalu ketik /op." });
         return;
       }
-      const quotedId = quoted.stanzaId;
-      const cached = viewOnceCache[quotedId];
-      if (!cached || cached.senderJid !== senderJid) {
-        await sock.sendMessage(senderJid, { text: "⚠️ Tidak menemukan media itu di cache." });
-        return;
-      }
-      if (Date.now() - cached.timestamp > CACHE_EXPIRATION_MS) {
-        await sock.sendMessage(senderJid, { text: "⚠️ Media 1x lihat sudah kedaluwarsa (>24 jam)." });
+
+      if (global.viewOnceCache && global.viewOnceCache.has(quotedMsgId)) {
+        const cachedData = global.viewOnceCache.get(quotedMsgId);
+        if (cachedData.senderJid !== senderJid) {
+          await sock.sendMessage(senderJid, { text: "⚠️ Anda tidak berhak membuka media ini." });
+          return;
+        }
+        
         try {
-          await fs.unlink(cached.filePath);
-          delete viewOnceCache[quotedId];
-          await saveCacheToFile();
-        } catch {}
+          const fullMsg = cachedData.msg;
+          const buffer = await downloadMediaMessage(fullMsg, 'buffer', {});
+          const v2msg = fullMsg.message.viewOnceMessageV2 || fullMsg.message.viewOnceMessageV2Extension;
+          const isVideo = !!v2msg.message.videoMessage;
+          
+          const caption = `📤 Ini adalah ${isVideo ? 'video' : 'gambar'} 1x lihat yang Anda minta.`;
+          const sendOpt = isVideo 
+            ? { video: buffer, caption } 
+            : { image: buffer, caption };
+
+          await sock.sendMessage(senderJid, sendOpt);
+          console.log(`✅ Berhasil mengirim ulang media 1x lihat dari cache.`);
+          global.viewOnceCache.delete(quotedMsgId);
+
+        } catch (error) {
+          console.error("Gagal membuka media view once:", error);
+          await sock.sendMessage(senderJid, { text: "⚠️ Gagal membuka media. Mungkin sudah terlalu lama atau terjadi kesalahan." });
+        }
         return;
       }
-      console.log(`📤 Mengirim ulang media: ${cached.fileName}`);
-      const msgOpt = cached.isVideo
-        ? { video: { url: cached.filePath }, caption: "📤 Ini media 1x lihat yang Anda maksud." }
-        : { image: { url: cached.filePath }, caption: "📤 Ini media 1x lihat yang Anda maksud." };
-      await sock.sendMessage(senderJid, msgOpt);
+
+      const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+      if (quotedMsg?.imageMessage || quotedMsg?.videoMessage) {
+        let mediaToSteal = quotedMsg.imageMessage || quotedMsg.videoMessage;
+        let mediaType = quotedMsg.imageMessage ? 'image' : 'video';
+
+        try {
+          await sock.sendMessage(senderJid, { react: { text: "⏳", key: msg.key } });
+          
+          const quotedMsgObj = {
+            key: {
+              remoteJid: senderJid,
+              id: quotedMsgId,
+              participant: msg.message.extendedTextMessage.contextInfo.participant
+            },
+            message: quotedMsg
+          };
+
+          const buffer = await downloadMediaMessage(quotedMsgObj, 'buffer', {});
+          const caption = `📤 Ini adalah ${mediaType === 'image' ? 'gambar' : 'video'} dari pesan yang Anda reply.`;
+          const sendOpt = mediaType === 'image' 
+            ? { image: buffer, caption } 
+            : { video: buffer, caption };
+
+          await sock.sendMessage(senderJid, sendOpt);
+          console.log(`✅ Berhasil "mencuri" dan mengirim ulang ${mediaType}.`);
+        } catch (error) {
+          console.error("Gagal mencuri media:", error);
+          await sock.sendMessage(senderJid, { text: "⚠️ Gagal mengambil media. Mungkin media sudah kedaluwarsa atau tidak dapat diakses." });
+        } finally {
+          await sock.sendMessage(senderJid, { react: { text: "", key: msg.key } });
+        }
+      } else {
+        await sock.sendMessage(senderJid, { text: "❌ Pesan yang Anda reply tidak mengandung gambar atau video yang bisa diambil." });
+      }
       return;
     }
 
+    // === /str untuk generate stiker ===
+    if (command === '/str') {
+      let mediaToConvert = null;
+      let isVideo = false;
+
+      const quotedMsg = msg.message.extendedTextMessage?.contextInfo?.quotedMessage;
+      if (quotedMsg) {
+        if (quotedMsg.imageMessage) {
+          mediaToConvert = quotedMsg.imageMessage;
+        } else if (quotedMsg.videoMessage) {
+          mediaToConvert = quotedMsg.videoMessage;
+          isVideo = true;
+        }
+      } else {
+        if (msg.message.imageMessage) {
+          mediaToConvert = msg.message.imageMessage;
+        } else if (msg.message.videoMessage) {
+          mediaToConvert = msg.message.videoMessage;
+          isVideo = true;
+        }
+      }
+
+      if (!mediaToConvert) {
+        await sock.sendMessage(senderJid, { text: "❌ Kirim atau reply sebuah gambar/video (maks 5 detik) dengan caption /str." });
+        return;
+      }
+
+      if (isVideo && mediaToConvert.seconds > 5) {
+        await sock.sendMessage(senderJid, { text: "❌ Durasi video maksimal adalah 5 detik." });
+        return;
+      }
+
+      try {
+        await sock.sendMessage(senderJid, { react: { text: "⏳", key: msg.key } });
+        const buffer = await downloadMediaMessage(msg, 'buffer', {});
+        const stickerBuffer = await createSticker(buffer, isVideo);
+        await sock.sendMessage(senderJid, { sticker: stickerBuffer }, { quoted: msg });
+        console.log(`✅ Stiker berhasil dikirim ke ${senderJid}`);
+      } catch (error) {
+        console.error("Gagal membuat stiker:", error);
+        await sock.sendMessage(senderJid, { text: "⚠️ Gagal membuat stiker. Pastikan media valid." });
+      } finally {
+        await sock.sendMessage(senderJid, { react: { text: "", key: msg.key } });
+      }
+      return;
+    }
+
+    // === /ingat, /apa, /lupa untuk pengingat percakapan ===
+    if (command.startsWith('/ingat')) {
+        const factToRemember = messageText.slice(7).trim();
+        if (!factToRemember) {
+            await sock.sendMessage(senderJid, { text: "⚙️ Gunakan format: /ingat <informasi yang ingin diingat>" });
+            return;
+        }
+        addMessageToMemory(senderJid, 'system', factToRemember);
+        await sock.sendMessage(senderJid, { text: "✅ Baik, saya akan ingat itu." });
+        return;
+    }
+
+    if (command === '/apa') {
+        const memory = getMemory(senderJid);
+        if (memory.length === 0) {
+            await sock.sendMessage(senderJid, { text: "Saya tidak ingat apa-apa tentang obrolan ini." });
+            return;
+        }
+        const memoryText = memory.map(m => `- ${m.role === 'system' ? 'INFO' : m.role.toUpperCase()}: ${m.content}`).join('\n');
+        await sock.sendMessage(senderJid, { text: `Ini yang saya ingat dari obrolan kita:\n\n${memoryText}` });
+        return;
+    }
+
+    if (command === '/lupa') {
+        setMemory(senderJid, []);
+        await sock.sendMessage(senderJid, { text: "🗑️ Oke, saya sudah lupa semua yang kita bicarakan." });
+        return;
+    }
+
     // === /ai untuk interaksi dengan Gemini ===
-    if (messageText.toLowerCase().startsWith('/ai')) {
+    if (command.startsWith('/ai')) {
       const prompt = messageText.replace(/^\/ai\s*/i, '').trim();
       if (!prompt) {
         await sock.sendMessage(senderJid, { text: '⚙️ Gunakan format: /ai <pertanyaan kamu>' });
         return;
       }
 
-      console.log(`⏳ [PROSES AI] "${prompt}"`);
+      const memory = getMemory(senderJid);
+      const history = memory.map(m => ({ role: m.role, parts: [{ text: m.content }] }));
+
+      console.log(`⏳ [PROSES AI] "${prompt}" dengan ${history.length} konteks memori.`);
       try {
         await sock.sendMessage(senderJid, { react: { text: "⏰", key: msg.key } });
         await sock.sendPresenceUpdate('composing', senderJid);
-        const result = await model.generateContent(prompt);
+        
+        const chat = model.startChat({ history });
+        const result = await chat.sendMessage(prompt);
         const aiReply = result.response.text() || "Maaf, saya tidak bisa menjawab itu.";
+        
         await sock.sendMessage(senderJid, { text: aiReply }, { quoted: msg });
+        
+        addMessageToMemory(senderJid, 'user', prompt);
+        addMessageToMemory(senderJid, 'model', aiReply);
+
         console.log(`📤 [BALASAN AI TERKIRIM]`);
       } catch (error) {
         let errMsg = '⚠️ Maaf, terjadi kesalahan internal.';
@@ -415,72 +456,7 @@ async function connectToWhatsApp() {
           await sock.sendMessage(senderJid, { react: { text: "", key: msg.key } });
         } catch {}
       }
-      return; // Stop processing after handling AI command
     }
-
-    // === .brat untuk buat stiker teks ===
-    if (messageText.toLowerCase().startsWith('.brat')) {
-      const prompt = messageText.replace(/^\.brat\s*/i, '').trim();
-      if (!prompt) {
-        await sock.sendMessage(senderJid, { text: '⚙️ Gunakan format: .brat <teks kamu>' });
-        return;
-      }
-
-      console.log(`🎨 [PROSES BRAT STICKER] "${prompt}"`);
-      await sock.sendMessage(senderJid, { text: '⏳ Membuat stiker brat...' }, { quoted: msg });
-
-      const words = prompt.split(/\s+/);
-      const fontPath = "/system/fonts/Roboto-Regular.ttf"; // bisa ganti brat.ttf
-
-      // posisi X acak: kiri / tengah / kanan
-      const positions = ["10", "(w-text_w)/2", "w-tw-10"];
-
-      let drawTexts = words.map((word, i) => {
-        const posX = positions[Math.floor(Math.random() * positions.length)];
-        const posY = 50 + i * 100; // tiap baris turun 100px
-        return `drawtext=text='${word}':fontfile=${fontPath}:fontsize=80:fontcolor=black:x=${posX}:y=${posY}`;
-      }).join(",");
-
-      const tempPng = path.join(VIEWONCE_DIR, `${randomBytes(6).toString('hex')}.png`);
-      const tempWebp = path.join(VIEWONCE_DIR, `${randomBytes(6).toString('hex')}.webp`);
-
-      const genPngCommand = `ffmpeg -f lavfi -i color=c=white:s=512x512 -vf "${drawTexts}" -frames:v 1 ${tempPng}`;
-
-      exec(genPngCommand, (error) => {
-        if (error) {
-          console.error('❌ Gagal membuat gambar PNG brat:', error);
-          sock.sendMessage(senderJid, { text: '⚠️ Gagal membuat gambar brat.' }, { quoted: msg });
-          return;
-        }
-
-        const genWebpCommand = `ffmpeg -i ${tempPng} -vcodec libwebp -lossless 1 -q:v 90 -preset default -loop 0 -an -vsync 0 -s 512:512 ${tempWebp}`;
-        exec(genWebpCommand, async (error) => {
-          const cleanup = async () => {
-            try { await fs.unlink(tempPng); } catch {}
-            try { await fs.unlink(tempWebp); } catch {}
-          };
-
-          if (error) {
-            console.error('❌ Gagal konversi brat ke WEBP:', error);
-            await sock.sendMessage(senderJid, { text: '⚠️ Gagal konversi brat.' }, { quoted: msg });
-            await cleanup();
-            return;
-          }
-
-          try {
-            const stickerBuffer = await fs.readFile(tempWebp);
-            await sock.sendMessage(senderJid, { sticker: stickerBuffer });
-          } catch (e) {
-            console.error('❌ Gagal kirim stiker brat:', e);
-            await sock.sendMessage(senderJid, { text: '⚠️ Gagal kirim stiker brat.' }, { quoted: msg });
-          } finally {
-            await cleanup();
-          }
-        });
-      });
-      return;
-    }
-
   });
 
   return sock;
